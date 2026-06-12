@@ -3,4 +3,4 @@ Repository to control freetronics 32x16 dmd by webserver and other users can con
 
 TODO:
 Implement wifimanager library to avoid hardcoding wifi credentials, use a push button held down on startup to enter wifimanager mode
-images/Capture.PNG
+![Alt text](images/Capture.png)
