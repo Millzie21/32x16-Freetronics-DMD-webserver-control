@@ -6,8 +6,8 @@
 #include "fonts/Arial_black_16.h"
 
 /*----------------------------- WiFi credentials -----------------------------*/
-const char *ssid = "ssid";
-const char *password = "password";
+const char *ssid = "XXXXXX";
+const char *password = "XXXXXX";
 
 #define DISPLAYS_ACROSS 1
 #define DISPLAYS_DOWN   1
@@ -20,8 +20,8 @@ const char *password = "password";
 const unsigned long BUZZER_PULSE_MS = 100;
 
 /*------------------------- BRIGHTNESS (LEDC PWM on OE, pot-controlled) ----------*/
-volatile uint8_t brightness = 10;      // current level; driven by the potentiometer
-#define LEDC_FREQ_HZ   20000   // 20 kHz, above scan rate -> no visible flicker
+volatile uint8_t brightness = 255;   // current level; driven by the potentiometer
+#define LEDC_FREQ_HZ   78000   // high freq so duty changes engage promptly
 #define LEDC_RES_BITS  8       // 8-bit -> duty 0..255 maps directly to brightness
 
 #define POT_PIN         35     // ADC1 input-only pin for the potentiometer wiper
@@ -90,12 +90,14 @@ void IRAM_ATTR triggerScan() {
   if (hpw == pdTRUE) portYIELD_FROM_ISR();
 }
 
+// Blank OE during the scan (data shift + row change), then restore brightness PWM.
+// This prevents multiplex ghosting that's visible at low brightness.
 void scanTask(void *pv) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    ledcWrite(PIN_DMD_nOE, 0);  
+    ledcWrite(PIN_DMD_nOE, 0);            // OE off while shifting
     dmd.scanDisplayBySPI();
-    ledcWrite(PIN_DMD_nOE, brightness);
+    ledcWrite(PIN_DMD_nOE, brightness);   // restore on-time for this row
   }
 }
 
@@ -108,9 +110,8 @@ void updateBrightnessFromPot() {
   uint8_t b = map(raw, 0, 4095, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
 
   // Only update on a meaningful change to avoid ADC-jitter flicker.
-  if (abs((int)b - (int)brightness) >= 2) {
-    brightness = b;
-  }
+  if (abs((int)b - (int)brightness) >= 2)
+    brightness = b;                              // scanTask applies it next scan
 }
 
 const char *modeName(Mode m) {
@@ -351,6 +352,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   h1{font-size:18px;margin:0 0 12px}
   .card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:14px;margin-bottom:14px;text-align:center}
   .mode{font-weight:700;color:#4ade80}
+  .grid-scroll{margin:0 auto}
   #grid{display:grid;grid-template-columns:repeat(32,1fr);gap:1px;max-width:640px;margin:0 auto;background:#000;
         border:2px solid #444;border-radius:6px;padding:2px;touch-action:manipulation}
   .cell{aspect-ratio:1;background:#222;border-radius:1px;cursor:pointer}
@@ -364,6 +366,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   #msg{margin-top:10px;min-height:20px;color:#fbbf24;font-size:14px}
   #conn{font-size:12px;color:#888;margin-top:4px}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center}
+
+  @media (max-width:680px){
+    /* let the grid exceed the screen and scroll, so cells stay big enough to tap */
+    .grid-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+    #grid{grid-template-columns:repeat(32,18px);grid-auto-rows:18px;width:max-content;max-width:none}
+    .cell{aspect-ratio:auto;width:18px;height:18px}
+  }
 </style>
 </head>
 <body>
@@ -378,7 +387,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="card">
     <strong>Pixel drawing</strong>
     <p style="font-size:13px;color:#aaa;margin:8px 0">Tap a cell to toggle that pixel on the panel.</p>
-    <div id="grid"></div>
+    <div class="grid-scroll"><div id="grid"></div></div>
     <div class="row" style="margin-top:12px">
       <button class="alt" onclick="clearGrid()">Clear</button>
       <button class="alt" onclick="invertGrid()">Invert</button>
@@ -405,6 +414,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const c=document.createElement('div');
     c.className='cell';c.dataset.x=x;c.dataset.y=y;
     c.addEventListener('click',()=>toggle(c));
+    c.addEventListener('mouseleave',()=>{c.dataset.locked='';});
+    c.addEventListener('touchend',()=>{c.dataset.locked='';});
     grid.appendChild(c);cells.push(c);
   }}
 
@@ -437,7 +448,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   connect();
 
   function send(s){if(ws&&ws.readyState===1)ws.send(s);else showMsg('Not connected');}
-  function toggle(c){const on=c.classList.toggle('on');send('P:'+c.dataset.x+','+c.dataset.y+','+(on?1:0));}
+  function toggle(c){
+    if(c.dataset.locked==='1')return;     // already acted this hover; ignore
+    c.dataset.locked='1';                 // lock until the mouse leaves / touch ends
+    const on=c.classList.toggle('on');
+    send('P:'+c.dataset.x+','+c.dataset.y+','+(on?1:0));
+  }
   function sendScroll(){
     let v=document.getElementById('txt').value;
     if(v.length>100){showMsg('User entered more than 100 characters');v=v.slice(0,100);}
