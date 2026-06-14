@@ -24,13 +24,13 @@ const unsigned long BUZZER_PULSE_MS = 100;
 #define WIFI_CONNECT_TIMEOUT_MS 15000
 
 /*------------------------- BRIGHTNESS (LEDC PWM on OE, pot-controlled) ----------*/
-volatile uint8_t brightness = 255;   // current level; driven by the potentiometer
+volatile uint8_t brightness = 128;   // current level; driven by the potentiometer
 #define LEDC_FREQ_HZ   78000   // high freq so duty changes engage promptly
 #define LEDC_RES_BITS  8       // 8-bit -> duty 0..255 maps directly to brightness
 
 #define POT_PIN         35     // ADC1 input-only pin for the potentiometer wiper
-#define BRIGHTNESS_MIN  1
-#define BRIGHTNESS_MAX  255
+#define BRIGHTNESS_MIN  5
+#define BRIGHTNESS_MAX  128
 const unsigned long POT_READ_MS = 50;   // how often to sample the pot
 
 /*------------------------- GLOBALS -------------------------*/
@@ -137,13 +137,26 @@ bool tryConnect(const String &ssid, const String &pass, uint32_t timeoutMs) {
 }
 
 /*------------------------- HELPERS -------------------------*/
+float potAvg = -1;   // running average of raw ADC (add as a global, or static below)
+
 void updateBrightnessFromPot() {
   if (millis() - lastPotRead < POT_READ_MS) return;
   lastPotRead = millis();
-  int raw = analogRead(POT_PIN);
-  uint8_t b = map(raw, 0, 4095, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
-  if (abs((int)b - (int)brightness) >= 2)
-    brightness = b;   // scanTask applies it next scan
+
+  // Average several samples to knock down per-read noise.
+  uint32_t acc = 0;
+  for (int i = 0; i < 8; i++) acc += analogRead(POT_PIN);
+  float raw = acc / 8.0f;
+
+  // Exponential smoothing so small jitter doesn't move the value.
+  if (potAvg < 0) potAvg = raw;
+  potAvg += (raw - potAvg) * 0.2f;
+
+  uint8_t b = map((int)potAvg, 0, 4095, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+
+  // Hysteresis: only commit a change of at least 3 levels.
+  if (abs((int)b - (int)brightness) >= 3)
+    brightness = b;
 }
 
 const char *modeName(Mode m) {
