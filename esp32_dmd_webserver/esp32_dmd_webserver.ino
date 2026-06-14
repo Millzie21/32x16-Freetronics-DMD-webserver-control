@@ -1,14 +1,14 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <LittleFS.h>
+#include <DNSServer.h>
+
 #include <DMD32Plus.h>
 #include "fonts/SystemFont5x7.h"
 #include "fonts/Arial_black_16.h"
 
-/*----------------------------- WiFi credentials -----------------------------*/
-const char *ssid = "XXXXXX";
-const char *password = "XXXXXX";
-
+/*------------------------- USER CONFIG -------------------------*/
 #define DISPLAYS_ACROSS 1
 #define DISPLAYS_DOWN   1
 #define PANEL_W (32 * DISPLAYS_ACROSS)
@@ -19,13 +19,17 @@ const char *password = "XXXXXX";
 #define BUZZER_PIN  25         // pulses HIGH 100ms on each client connect
 const unsigned long BUZZER_PULSE_MS = 100;
 
+#define WIFI_CONFIG_FILE "/wifi.txt"
+#define AP_NAME          "DMD-Setup"
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+
 /*------------------------- BRIGHTNESS (LEDC PWM on OE, pot-controlled) ----------*/
 volatile uint8_t brightness = 255;   // current level; driven by the potentiometer
 #define LEDC_FREQ_HZ   78000   // high freq so duty changes engage promptly
 #define LEDC_RES_BITS  8       // 8-bit -> duty 0..255 maps directly to brightness
 
 #define POT_PIN         35     // ADC1 input-only pin for the potentiometer wiper
-#define BRIGHTNESS_MIN  5
+#define BRIGHTNESS_MIN  1
 #define BRIGHTNESS_MAX  255
 const unsigned long POT_READ_MS = 50;   // how often to sample the pot
 
@@ -34,6 +38,9 @@ DMD dmd(DISPLAYS_ACROSS, DISPLAYS_DOWN);
 hw_timer_t *timer = NULL;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+DNSServer dnsServer;
+
+bool portalMode = false;       // true when running the WiFi config AP
 
 enum Mode { BOOT, PIXEL, SCROLL, RANDOM };
 volatile Mode currentMode = BOOT;
@@ -69,6 +76,7 @@ char scrollText[256]       = "Hello from ESP32 DMD!";
 char activeScrollText[256] = "";
 volatile bool clearRequested  = false;
 volatile bool invertRequested = false;
+volatile bool displayBlank = false;
 
 // Buzzer pulse state
 volatile bool buzzerRequested = false;
@@ -91,27 +99,51 @@ void IRAM_ATTR triggerScan() {
 }
 
 // Blank OE during the scan (data shift + row change), then restore brightness PWM.
-// This prevents multiplex ghosting that's visible at low brightness.
 void scanTask(void *pv) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (displayBlank) { ledcWrite(PIN_DMD_nOE, 0); continue; }   // stay dark
     ledcWrite(PIN_DMD_nOE, 0);            // OE off while shifting
     dmd.scanDisplayBySPI();
     ledcWrite(PIN_DMD_nOE, brightness);   // restore on-time for this row
   }
 }
 
+/*------------------------- WIFI CREDENTIAL STORAGE -------------------------*/
+bool loadWiFiCreds(String &ssid, String &pass) {
+  if (!LittleFS.exists(WIFI_CONFIG_FILE)) return false;
+  File f = LittleFS.open(WIFI_CONFIG_FILE, "r");
+  if (!f) return false;
+  ssid = f.readStringUntil('\n'); ssid.trim();
+  pass = f.readStringUntil('\n'); pass.trim();
+  f.close();
+  return ssid.length() > 0;
+}
+
+void saveWiFiCreds(const String &ssid, const String &pass) {
+  File f = LittleFS.open(WIFI_CONFIG_FILE, "w");
+  if (!f) return;
+  f.println(ssid);
+  f.println(pass);
+  f.close();
+}
+
+bool tryConnect(const String &ssid, const String &pass, uint32_t timeoutMs) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) delay(250);
+  return WiFi.status() == WL_CONNECTED;
+}
+
 /*------------------------- HELPERS -------------------------*/
 void updateBrightnessFromPot() {
   if (millis() - lastPotRead < POT_READ_MS) return;
   lastPotRead = millis();
-
-  int raw = analogRead(POT_PIN);                 // 0..4095 on ESP32
+  int raw = analogRead(POT_PIN);
   uint8_t b = map(raw, 0, 4095, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
-
-  // Only update on a meaningful change to avoid ADC-jitter flicker.
   if (abs((int)b - (int)brightness) >= 2)
-    brightness = b;                              // scanTask applies it next scan
+    brightness = b;   // scanTask applies it next scan
 }
 
 const char *modeName(Mode m) {
@@ -143,10 +175,8 @@ void enterBootMode() {
   currentMode = BOOT;
   dmd.clearScreen(true);
   dmd.selectFont(Arial_Black_16);
-
   String ip = "IP " + WiFi.localIP().toString();
   ip.toCharArray(activeScrollText, sizeof(activeScrollText));
-
   dmd.drawMarquee(activeScrollText, strlen(activeScrollText), PANEL_W - 1, 0);
   lastScrollStep = millis();
 }
@@ -155,12 +185,9 @@ void enterScrollMode() {
   currentMode = SCROLL;
   dmd.clearScreen(true);
   dmd.selectFont(Arial_Black_16);
-
   strncpy(activeScrollText, scrollText, sizeof(activeScrollText) - 1);
   activeScrollText[sizeof(activeScrollText) - 1] = '\0';
-  if (strlen(activeScrollText) == 0)
-    strcpy(activeScrollText, " ");
-
+  if (strlen(activeScrollText) == 0) strcpy(activeScrollText, " ");
   dmd.drawMarquee(activeScrollText, strlen(activeScrollText), PANEL_W - 1, 0);
   lastScrollStep = millis();
 }
@@ -176,7 +203,7 @@ void enterRandomMode() {
   currentMode = RANDOM;
   dmd.clearScreen(true);
   randomPhaseStart = millis();
-  lastRandomStep = 0;   // forces an immediate first randomize
+  lastRandomStep = 0;
 }
 
 void stepScroll() {
@@ -187,7 +214,6 @@ void stepScroll() {
   }
 }
 
-// Flicker every pixel on/off. Does NOT modify pixelBuffer (drawing is preserved).
 void stepRandom() {
   if (millis() - lastRandomStep >= RANDOM_STEP_MS) {
     lastRandomStep = millis();
@@ -222,11 +248,9 @@ void drainMsgQueue() {
     ws.textAll(m.text);
 }
 
-// Push current device state to one client (runs from loop -> no data race).
 void sendStateToClient(uint32_t id) {
   ws.text(id, String("MODE:") + modeName(currentMode));
   ws.text(id, String("TEXT:") + scrollText);
-
   char pix[PANEL_W * PANEL_H + 8];
   int n = 0;
   pix[n++] = 'P'; pix[n++] = 'I'; pix[n++] = 'X'; pix[n++] = ':';
@@ -256,7 +280,6 @@ void queueMsg(const char *m) {
   xQueueSend(msgQueue, &msg, 0);
 }
 
-// Remove an id from the tracking array.
 void removeClientId(uint32_t id) {
   for (int i = 0; i < clientIdCount; i++) {
     if (clientIds[i] == id) {
@@ -290,7 +313,7 @@ void handleWsMessage(const String &s) {
   } else if (type == 'S') {                // S:text
     ScrollMsg sm;
     String t = s.substring(s.indexOf(':') + 1);
-    if (t.length() > 100) t = t.substring(0, 100);   // cap at 100 chars
+    if (t.length() > 100) t = t.substring(0, 100);
     t.toCharArray(sm.text, sizeof(sm.text));
     xQueueSend(scrollQueue, &sm, 0);
     char m[200];
@@ -309,10 +332,8 @@ void onWsEvent(AsyncWebSocket *srv, AsyncWebSocketClient *client,
                AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
     uint32_t id = client->id();
-    buzzerRequested = true;            // pulse the buzzer on connect
+    buzzerRequested = true;
     if (clientIdCount < MAX_TRACK) clientIds[clientIdCount++] = id;
-
-    // Over the limit -> disconnect ALL clients (including this new one).
     if (clientIdCount > MAX_CLIENTS) {
       for (int i = 0; i < clientIdCount; i++) {
         ws.text(clientIds[i], "BYE");
@@ -321,12 +342,9 @@ void onWsEvent(AsyncWebSocket *srv, AsyncWebSocketClient *client,
       clientIdCount = 0;
       return;
     }
-
     xQueueSend(syncQueue, &id, 0);
-
   } else if (type == WS_EVT_DISCONNECT) {
     removeClientId(client->id());
-
   } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
     if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
@@ -338,7 +356,7 @@ void onWsEvent(AsyncWebSocket *srv, AsyncWebSocketClient *client,
   }
 }
 
-/*------------------------- WEB PAGE -------------------------*/
+/*------------------------- WEB PAGE (main UI) -------------------------*/
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -368,7 +386,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center}
 
   @media (max-width:680px){
-    /* let the grid exceed the screen and scroll, so cells stay big enough to tap */
     .grid-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
     #grid{grid-template-columns:repeat(32,18px);grid-auto-rows:18px;width:max-content;max-width:none}
     .cell{aspect-ratio:auto;width:18px;height:18px}
@@ -449,8 +466,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
   function send(s){if(ws&&ws.readyState===1)ws.send(s);else showMsg('Not connected');}
   function toggle(c){
-    if(c.dataset.locked==='1')return;     // already acted this hover; ignore
-    c.dataset.locked='1';                 // lock until the mouse leaves / touch ends
+    if(c.dataset.locked==='1')return;
+    c.dataset.locked='1';
     const on=c.classList.toggle('on');
     send('P:'+c.dataset.x+','+c.dataset.y+','+(on?1:0));
   }
@@ -476,51 +493,75 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-/*------------------------- SETUP -------------------------*/
-void setup() {
-  Serial.begin(115200);
+/*------------------------- WEB PAGE (WiFi config portal) -------------------------*/
+const char CONFIG_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DMD WiFi Setup</title>
+<style>body{font-family:system-ui,Arial;background:#111;color:#eee;display:flex;justify-content:center;padding:24px;margin:0}
+.card{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:20px;max-width:360px;width:100%}
+label{font-size:13px;color:#aaa}
+input{width:100%;padding:10px;margin:6px 0 14px;border-radius:6px;border:1px solid #444;background:#000;color:#eee;box-sizing:border-box}
+button{width:100%;padding:10px;border:0;border-radius:6px;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer}
+h2{margin-top:0}</style></head>
+<body><div class="card"><h2>DMD WiFi Setup</h2>
+<form method="POST" action="/save">
+<label>WiFi network (SSID)</label><input name="ssid" required>
+<label>Password</label><input name="pass" type="password">
+<button type="submit">Save &amp; Reboot</button></form></div></body></html>
+)rawliteral";
 
-  pinMode(PIN_OTHER_SPI_nCS, OUTPUT);
-  digitalWrite(PIN_OTHER_SPI_nCS, HIGH);
-
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-
-  xTaskCreatePinnedToCore(scanTask, "dmdScan", 4096, NULL,
-                          configMAX_PRIORITIES - 1, &scanTaskHandle, 1);
-
-  timer = timerBegin(1000000L);
-  timerAttachInterrupt(timer, &triggerScan);
-  timerAlarm(timer, 1000, true, 0);
+/*------------------------- CONFIG PORTAL -------------------------*/
+void enterPortalDisplay() {
+  // Scroll setup instructions on the DMD so a headless unit is usable.
   dmd.clearScreen(true);
+  ledcWrite(PIN_DMD_nOE, 0);
+}
 
-  analogReadResolution(12);                      // 0..4095
-  analogSetPinAttenuation(POT_PIN, ADC_11db);    // full ~0..3.3V range
-  ledcAttach(PIN_DMD_nOE, LEDC_FREQ_HZ, LEDC_RES_BITS);
-  ledcWrite(PIN_DMD_nOE, brightness);
+void startConfigPortal() {
+  portalMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_NAME);
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.print("Config portal AP: "); Serial.println(AP_NAME);
+  Serial.print("Browse to http://"); Serial.println(apIP);
 
-  randomSeed(esp_random());   // seed RNG for random mode
+  dnsServer.start(53, "*", apIP);   // captive portal: route all DNS to us
 
-  pixelQueue  = xQueueCreate(256, sizeof(PixelCmd));
-  scrollQueue = xQueueCreate(4,   sizeof(ScrollMsg));
-  msgQueue    = xQueueCreate(16,  sizeof(WsMsg));
-  syncQueue   = xQueueCreate(12,  sizeof(uint32_t));
-  closeQueue  = xQueueCreate(12,  sizeof(uint32_t));
-  memset(pixelBuffer, 0, sizeof(pixelBuffer));
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
+    req->send_P(200, "text/html", CONFIG_HTML);
+  });
+  server.on("/save", HTTP_POST, [](AsyncWebServerRequest *req){
+    String ssid, pass;
+    if (req->hasParam("ssid", true)) ssid = req->getParam("ssid", true)->value();
+    if (req->hasParam("pass", true)) pass = req->getParam("pass", true)->value();
+    saveWiFiCreds(ssid, pass);
+    req->send(200, "text/html",
+      "<body style='font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:40px'>"
+      "Saved. Rebooting...</body>");
+    delay(600);
+    ESP.restart();
+  });
+  server.onNotFound([](AsyncWebServerRequest *req){   // captive-portal catch-all
+    req->send_P(200, "text/html", CONFIG_HTML);
+  });
+  server.begin();
+  displayBlank = true;
+  enterPortalDisplay();
+}
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println();
-  Serial.print("DMD web UI: http://");
-  Serial.println(WiFi.localIP());
-
+/*------------------------- NORMAL SERVER ROUTES -------------------------*/
+void startMainServer() {
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
     req->send_P(200, "text/html", INDEX_HTML);
+  });
+  server.on("/resetwifi", HTTP_GET, [](AsyncWebServerRequest *req){
+    LittleFS.remove(WIFI_CONFIG_FILE);
+    req->send(200, "text/plain", "WiFi credentials cleared. Rebooting into setup...");
+    delay(600);
+    ESP.restart();
   });
   server.onNotFound([](AsyncWebServerRequest *req){
     req->send(404, "text/plain", "Not found");
@@ -530,8 +571,62 @@ void setup() {
   enterBootMode();   // scroll the IP once before the normal cycle
 }
 
+/*------------------------- SETUP -------------------------*/
+void setup() {
+  Serial.begin(115200);
+
+  // --- hardware that should run in BOTH portal and normal mode ---
+  pinMode(PIN_OTHER_SPI_nCS, OUTPUT);
+  digitalWrite(PIN_OTHER_SPI_nCS, HIGH);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  xTaskCreatePinnedToCore(scanTask, "dmdScan", 4096, NULL,
+                          configMAX_PRIORITIES - 1, &scanTaskHandle, 1);
+  timer = timerBegin(1000000L);
+  timerAttachInterrupt(timer, &triggerScan);
+  timerAlarm(timer, 1000, true, 0);
+  dmd.clearScreen(true);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(POT_PIN, ADC_11db);
+  ledcAttach(PIN_DMD_nOE, LEDC_FREQ_HZ, LEDC_RES_BITS);
+  ledcWrite(PIN_DMD_nOE, brightness);
+
+  randomSeed(esp_random());
+
+  pixelQueue  = xQueueCreate(256, sizeof(PixelCmd));
+  scrollQueue = xQueueCreate(4,   sizeof(ScrollMsg));
+  msgQueue    = xQueueCreate(16,  sizeof(WsMsg));
+  syncQueue   = xQueueCreate(12,  sizeof(uint32_t));
+  closeQueue  = xQueueCreate(12,  sizeof(uint32_t));
+  memset(pixelBuffer, 0, sizeof(pixelBuffer));
+
+  if (!LittleFS.begin(true)) {   // format on first use
+    Serial.println("LittleFS mount failed");
+  }
+
+  // --- WiFi: saved creds, or config portal ---
+  String ssid, pass;
+  if (loadWiFiCreds(ssid, pass) && tryConnect(ssid, pass, WIFI_CONNECT_TIMEOUT_MS)) {
+    Serial.print("Connected. DMD web UI: http://");
+    Serial.println(WiFi.localIP());
+    startMainServer();
+  } else {
+    Serial.println("No/failed WiFi - starting config portal");
+    startConfigPortal();
+  }
+}
+
 /*------------------------- LOOP -------------------------*/
 void loop() {
+  // --- config portal mode: just service DNS + scroll the setup message ---
+  if (portalMode) {
+    dnsServer.processNextRequest();
+    return;
+  }
+
+  // --- normal operation ---
   ws.cleanupClients(MAX_TRACK);
   updateBrightnessFromPot();
   drainPixelQueue();
@@ -540,7 +635,6 @@ void loop() {
   drainSyncQueue();
   drainCloseQueue();
 
-  // Buzzer pulse (non-blocking): HIGH for BUZZER_PULSE_MS on client connect.
   if (buzzerRequested) {
     buzzerRequested = false;
     digitalWrite(BUZZER_PIN, HIGH);
@@ -570,7 +664,7 @@ void loop() {
     case BOOT:
       if (millis() - lastScrollStep >= SCROLL_STEP_MS) {
         lastScrollStep = millis();
-        if (dmd.stepMarquee(-1, 0))   // IP has fully scrolled off
+        if (dmd.stepMarquee(-1, 0))
           enterPixelPhase();
       }
       break;
